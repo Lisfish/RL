@@ -1,1 +1,137 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torch.utils.tensorboard import SummaryWriter
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
+
+# VGG-16 model as defined in vgg_16.py
+class VGG(nn.Module):
+    def __init__(self, features, num_class=2):  # Binary classification: Real vs Fake
+        super().__init__()
+        self.features = features
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 4 * 4, 4096),  # Adjusted for input size (150x150)
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, num_class)
+        )
+
+    def forward(self, x):
+        output = self.features(x)
+        output = output.view(output.size(0), -1)  # Flatten
+        output = self.classifier(output)
+        return output
+
+
+def make_layers(cfg, batch_norm=False):
+    layers = []
+    input_channel = 3
+    for l in cfg:
+        if l == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+            continue
+        layers += [nn.Conv2d(input_channel, l, kernel_size=3, padding=1)]
+        if batch_norm:
+            layers += [nn.BatchNorm2d(l)]
+        layers += [nn.ReLU(inplace=True)]
+        input_channel = l
+    return nn.Sequential(*layers)
+
+
+cfg = {'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M']}
+
+
+def vgg16_bn():
+    return VGG(make_layers(cfg['D'], batch_norm=True))
+
+
+# Data Preprocessing for PGAN images (train and validation directories)
+transform_train = transforms.Compose([
+    transforms.Resize((150, 150)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+transform_test = transforms.Compose([
+    transforms.Resize((150, 150)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+# PGAN dataset (train and val directories for real vs fake images)
+train_dir = "/root/autodl-tmp/myrl/pggan_v2/train"  # Adjust to actual PGAN data location
+val_dir = "/root/autodl-tmp/myrl/pggan_v2/val"  # Adjust to actual PGAN data location
+
+train_dataset = datasets.ImageFolder(root=train_dir, transform=transform_train)
+val_dataset = datasets.ImageFolder(root=val_dir, transform=transform_test)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+# Initialize the VGG16 model
+model = vgg16_bn()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+# Loss function and optimizer
+loss_function = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4, nesterov=True)
+
+
+# Training and evaluation loop
+def train_model(epochs, model, train_loader, val_loader, optimizer, loss_function, device):
+    writer = SummaryWriter(log_dir="runs/pggan_vgg16")
+    best_acc = 0.0
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        for i, (inputs, labels) in enumerate(train_loader, 0):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_function(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}, Loss: {running_loss / len(train_loader)}")
+
+        # Validation phase
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        accuracy = 100 * correct / total
+        print(f"Validation Accuracy: {accuracy}%")
+
+        writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch)
+        writer.add_scalar('Accuracy/validation', accuracy, epoch)
+
+        if accuracy > best_acc:
+            best_acc = accuracy
+            torch.save(model.state_dict(), "best_pggan_vgg16.pth")
+            print(f"Model saved with accuracy: {best_acc}%")
+
+    writer.close()
+
+
+# Train the model
+train_model(epochs=50, model=model, train_loader=train_loader, val_loader=val_loader, optimizer=optimizer,
+            loss_function=loss_function, device=device)
