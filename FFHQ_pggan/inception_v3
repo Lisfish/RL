@@ -1,1 +1,163 @@
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, BatchNormalization
+
+
+# 数据加载：
+train_dir = r"/root/autodl-tmp/myrl/pggan_v2/train"  # 小样本训练集路径autodl-tmp/myrl/pggan_v2/train
+val_dir = r"/root/autodl-tmp/myrl/pggan_v2/val"  # 小样本验证集路径
+
+# 数据增强设置
+datagen = ImageDataGenerator(
+    rescale=1. / 255,  # 归一化
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.1,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# 生成训练数据和验证数据
+batch_size = 32
+
+train_generator = datagen.flow_from_directory(
+    train_dir,
+    target_size=(150, 150),  # 调整图像大小
+    batch_size=batch_size,
+    class_mode='sparse',  # 使用类别标签，且标签是整数（0 或 1）
+    shuffle=True
+)
+
+val_generator = datagen.flow_from_directory(
+    val_dir,
+    target_size=(150, 150),  # 调整图像大小
+    batch_size=batch_size,
+    class_mode='sparse',  # 使用类别标签，且标签是整数（0 或 1）
+    shuffle=False  # 验证集不需要打乱顺序
+)
+
+# 查看类别数
+print(f"类别数: {len(train_generator.class_indices)}")
+
+
+
+# 定义模型结构
+def learn_model(input_shape, num_classes, dropout_rate=0.6, learning_rate=5e-5):
+    base_model = InceptionV3(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # 冻结更多层，防止小数据集过拟合
+    for layer in base_model.layers[:280]:
+        layer.trainable = False
+
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+
+    # 添加 Batch Normalization
+    x = BatchNormalization()(x)
+
+    x = Dropout(dropout_rate)(x)
+    x = Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.002))(x)
+
+    # 添加 Batch Normalization
+    x = BatchNormalization()(x)
+
+    x = Dropout(0.6)(x)
+    predictions = Dense(num_classes, activation='softmax')(x)
+
+    model = tf.keras.Model(inputs=base_model.input, outputs=predictions)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.summary()
+    return model
+
+
+
+# 训练模型
+
+height, width, color = 150, 150, 3
+num_classes = len(train_generator.class_indices)  # 根据生成器自动获取类别数
+
+# 定义模型
+model = learn_model((height, width, color), num_classes)
+
+# 设置回调
+epochs = 100
+early_stopping = EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=6, min_lr=1e-6, verbose=1)
+checkpoint = ModelCheckpoint('/root/autodl-tmp/myrl/pggan_v2_data/best_model.h5', save_best_only=True,
+                             monitor='val_accuracy', mode='max')
+
+# 训练模型
+history = model.fit(
+    train_generator,
+    epochs=epochs,
+    validation_data=val_generator,
+    callbacks=[early_stopping, reduce_lr, checkpoint]
+)
+
+
+# 评估模型
+loss, accuracy = model.evaluate(val_generator)
+print("Test loss:", loss)
+print("Test accuracy:", accuracy)
+
+# 训练可视化
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+
+epochs_range = range(len(acc))
+
+plt.plot(epochs_range, acc, 'r', label="Training Accuracy")
+plt.plot(epochs_range, val_acc, 'b', label="Validation Accuracy")
+plt.title('Training and Validation Accuracy')
+plt.legend()
+plt.show()
+
+plt.plot(epochs_range, loss, 'r', label="Training Loss")
+plt.plot(epochs_range, val_loss, 'b', label="Validation Loss")
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.show()
+
+
+# 模型预测（如果需要）
+y_pred = model.predict(val_generator)
+
+# 保存模型
+model.save('/root/autodl-tmp/myrl/pggan_v2_data/my_model.h5')
+
+
+
+# 显示预测样本
+def plot_sample_image(image, true_label, predicted_label):
+    plt.imshow(image)
+
+    # 确保标签是整数
+    true_label = int(true_label)
+    predicted_label = int(predicted_label)
+
+    true_label_name = list(train_generator.class_indices.keys())[
+        list(train_generator.class_indices.values()).index(true_label)]
+    predicted_label_name = list(train_generator.class_indices.keys())[
+        list(train_generator.class_indices.values()).index(predicted_label)]
+
+    plt.title(f"True Label: {true_label_name}\nPredicted Label: {predicted_label_name}")
+    plt.axis('off')
+    plt.show()
+
+
+# 显示一些预测结果
+for i in range(10):
+    img, true_label = val_generator[i]
+    predicted_label = np.argmax(y_pred[i])
+    plot_sample_image(img[0], true_label[0], predicted_label)
 
